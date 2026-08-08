@@ -45,6 +45,13 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
+try:
+    import pystray
+    from PIL import Image as PILImage, ImageDraw as PILDraw
+    HAS_TRAY = True
+except Exception:
+    HAS_TRAY = False
+
 # ---------------------------------------------------------------------------
 # Configuration & paths
 # ---------------------------------------------------------------------------
@@ -1580,6 +1587,13 @@ class FocusGuardianApp:
         self.root.bind("<Escape>", self._on_escape_key)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # System tray icon
+        self._tray_icon = None
+        self._tray_thread = None
+        self._tray_quit = False
+        if HAS_TRAY:
+            self._create_tray_icon()
+
     # ---- Profile helpers ----
 
     def _get_active_profile(self):
@@ -1787,13 +1801,26 @@ class FocusGuardianApp:
         self._content_canvas.itemconfig(self._content_window, width=event.width)
 
     def _on_mousewheel(self, event):
-        self._content_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        # Only scroll the canvas — don't intercept scroll for Listbox/Treeview/Text
+        widget = event.widget
+        if isinstance(widget, (tk.Listbox, ttk.Treeview, tk.Text)):
+            return
+        # Only scroll if content actually overflows the canvas
+        canvas = self._content_canvas
+        bbox = canvas.bbox("all")
+        if bbox:
+            content_h = bbox[3] - bbox[1]
+            canvas_h = canvas.winfo_height()
+            if content_h <= canvas_h:
+                return  # Content fits, no need to scroll
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def _bind_mousewheel(self):
-        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        # Only bind to the canvas itself — NOT bind_all (which hijacks all scroll events)
+        self._content_canvas.bind("<MouseWheel>", self._on_mousewheel)
 
     def _unbind_mousewheel(self):
-        self.root.unbind_all("<MouseWheel>")
+        self._content_canvas.unbind("<MouseWheel>")
 
     def _switch_page(self, page_index):
         self._show_page(page_index)
@@ -2838,13 +2865,28 @@ class FocusGuardianApp:
 
     # ---- Schedule management ----
 
+    @staticmethod
+    def _fmt_12hr(time_str):
+        """Convert '09:00' to '9:00 AM', '17:00' to '5:00 PM'."""
+        try:
+            h, m = map(int, time_str.strip().split(":"))
+            period = "AM" if h < 12 else "PM"
+            h12 = h % 12
+            if h12 == 0:
+                h12 = 12
+            return f"{h12}:{m:02d} {period}"
+        except Exception:
+            return time_str
+
     def _refresh_schedules_display(self):
         for item in self.sched_tree.get_children():
             self.sched_tree.delete(item)
         schedules = self.cfg.get("schedules", [])
         for i, sched in enumerate(schedules):
             days_str = ScheduleEngine.format_days(sched.get("days", []))
-            time_str = f"{sched.get('start_time', '09:00')} - {sched.get('end_time', '17:00')}"
+            start_12 = self._fmt_12hr(sched.get("start_time", "09:00"))
+            end_12 = self._fmt_12hr(sched.get("end_time", "17:00"))
+            time_str = f"{start_12} - {end_12}"
             enabled_str = "✅" if sched.get("enabled", True) else "❌"
             self.sched_tree.insert("", tk.END, iid=str(i),
                 values=(sched["name"], sched.get("profile", ""), days_str, time_str, enabled_str))
@@ -2894,11 +2936,11 @@ class FocusGuardianApp:
         ttk.Label(form_frame, text="Start Time:").grid(row=2, column=0, sticky="w", pady=6)
         start_var = tk.StringVar(value=sched.get("start_time", "09:00"))
         ttk.Entry(form_frame, textvariable=start_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=6)
-        ttk.Label(form_frame, text="(HH:MM)", style="Dim.TLabel").grid(row=2, column=2, sticky="w")
+        ttk.Label(form_frame, text="(e.g. 9:00 AM)", style="Dim.TLabel").grid(row=2, column=2, sticky="w")
         ttk.Label(form_frame, text="End Time:").grid(row=3, column=0, sticky="w", pady=6)
         end_var = tk.StringVar(value=sched.get("end_time", "17:00"))
         ttk.Entry(form_frame, textvariable=end_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=6)
-        ttk.Label(form_frame, text="(HH:MM)", style="Dim.TLabel").grid(row=3, column=2, sticky="w")
+        ttk.Label(form_frame, text="(e.g. 5:00 PM)", style="Dim.TLabel").grid(row=3, column=2, sticky="w")
         ttk.Label(form_frame, text="Days:").grid(row=4, column=0, sticky="nw", pady=6)
         day_vars = []
         day_frame = ttk.Frame(form_frame)
@@ -3095,10 +3137,40 @@ class FocusGuardianApp:
         self.root.destroy()
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
-    def _on_close(self):
-        if self.timer_running:
-            if not dark_askyesno(self.root, "Quit", "A timer is running. Quit anyway?\n(Blocks removed, partial session saved.)"):
-                return
+    def _create_tray_icon(self):
+        """Create a system tray icon for background running."""
+        try:
+            img = PILImage.new('RGBA', (64, 64), (31, 31, 31, 255))
+            draw = PILDraw.Draw(img)
+            draw.ellipse([12, 12, 52, 52], outline=(76, 194, 255, 255), width=4)
+            draw.ellipse([24, 24, 40, 40], fill=(76, 194, 255, 255))
+
+            def on_show(icon, item):
+                self.root.after(0, self._restore_from_tray)
+
+            def on_quit(icon, item):
+                self._tray_quit = True
+                icon.stop()
+                self.root.after(0, self._force_quit)
+
+            menu = pystray.Menu(
+                pystray.MenuItem("Show FocusGuardian", on_show, default=True),
+                pystray.MenuItem("Quit", on_quit),
+            )
+            self._tray_icon = pystray.Icon("FocusGuardian", img, f"FocusGuardian v{APP_VERSION}", menu)
+            self._tray_thread = threading.Thread(target=self._tray_icon.run, daemon=True)
+            self._tray_thread.start()
+            logger.info("System tray icon created")
+        except Exception as e:
+            logger.debug(f"Tray icon failed (non-critical): {e}")
+
+    def _restore_from_tray(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def _force_quit(self):
+        self._tray_quit = True
         if self.timer_running and self.session_start:
             elapsed = int((datetime.now() - self.session_start).total_seconds() - self.paused_duration)
             if elapsed >= 5:
@@ -3115,6 +3187,13 @@ class FocusGuardianApp:
         self.tracker.close()
         logger.info(f"=== {APP_NAME} shutdown ===")
         self.root.destroy()
+
+    def _on_close(self):
+        """Minimize to tray instead of quitting (if tray is available)."""
+        if not self._tray_quit and HAS_TRAY and self._tray_icon:
+            self.root.withdraw()
+            return
+        self._force_quit()
 
 
 # ---------------------------------------------------------------------------
@@ -3133,20 +3212,13 @@ def is_admin():
 
 
 def main():
+    # Admin privileges handled by FocusGuardian.exe launcher (NSIS admin manifest).
+    # Windows shows UAC prompt automatically. No Python elevation code needed.
     # Crash handler — pythonw.exe has no console, so write errors to a file
-    # AND show a Windows MessageBox so the user knows what happened
     try:
         setup_logging()
         root = tk.Tk()
         app = FocusGuardianApp(root)
-        if not app._is_admin:
-            root.after(500, lambda: dark_showwarning(root,
-                "Limited mode",
-                f"{APP_NAME} is running without administrator privileges.\n\n"
-                "Timer, reminders, stats, profiles, and schedules work.\n"
-                "Website blocking requires admin/root:\n"
-                "  • Windows: right-click → Run as administrator\n"
-                "  • macOS/Linux: sudo python3 focus_guardian.py"))
         root.mainloop()
     except Exception:
         import traceback
